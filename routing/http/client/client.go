@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/benbjohnson/clock"
@@ -16,6 +18,9 @@ import (
 	"github.com/ipfs/go-libipfs/routing/http/internal/drjson"
 	"github.com/ipfs/go-libipfs/routing/http/server"
 	"github.com/ipfs/go-libipfs/routing/http/types"
+	"github.com/ipfs/go-libipfs/routing/http/types/iter"
+	jsontypes "github.com/ipfs/go-libipfs/routing/http/types/json"
+	"github.com/ipfs/go-libipfs/routing/http/types/ndjson"
 	logging "github.com/ipfs/go-log/v2"
 	record "github.com/libp2p/go-libp2p-record"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -23,13 +28,23 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-var logger = logging.Logger("service/delegatedrouting")
+var (
+	_      contentrouter.Client = &client{}
+	logger                      = logging.Logger("service/delegatedrouting")
+)
+
+const (
+	mediaTypeJSON   = "application/json"
+	mediaTypeNDJSON = "application/x-ndjson"
+)
 
 type client struct {
 	baseURL    string
 	httpClient httpClient
 	validator  record.Validator
 	clock      clock.Clock
+
+	accepts string
 
 	peerID   peer.ID
 	addrs    []types.Multiaddr
@@ -39,8 +54,6 @@ type client struct {
 	// used for testing, e.g. testing the server with a mangled signature
 	afterSignCallback func(req *types.WriteBitswapProviderRecord)
 }
-
-var _ contentrouter.Client = &client{}
 
 type httpClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -69,6 +82,12 @@ func WithProviderInfo(peerID peer.ID, addrs []multiaddr.Multiaddr) option {
 	}
 }
 
+func WithStreamResultsRequired() option {
+	return func(c *client) {
+		c.accepts = mediaTypeJSON
+	}
+}
+
 // New creates a content routing API client.
 // The Provider and identity parameters are option. If they are nil, the `Provide` method will not function.
 func New(baseURL string, opts ...option) (*client, error) {
@@ -83,6 +102,7 @@ func New(baseURL string, opts ...option) (*client, error) {
 		httpClient: defaultHTTPClient,
 		validator:  ipns.Validator{},
 		clock:      clock.New(),
+		accepts:    strings.Join([]string{mediaTypeNDJSON, mediaTypeJSON}, ","),
 	}
 
 	for _, opt := range opts {
@@ -96,10 +116,13 @@ func New(baseURL string, opts ...option) (*client, error) {
 	return client, nil
 }
 
-func (c *client) FindProviders(ctx context.Context, key cid.Cid) (provs []types.ProviderResponse, err error) {
+func (c *client) FindProviders(ctx context.Context, key cid.Cid) (provs iter.Iter[types.ProviderResponse], err error) {
 	measurement := newMeasurement("FindProviders")
 	defer func() {
-		measurement.length = len(provs)
+		if sliceIter, ok := provs.(*iter.SliceIter[types.ProviderResponse]); ok {
+			length := len(sliceIter.Slice)
+			measurement.length = &length
+		}
 		measurement.record(ctx)
 	}()
 
@@ -108,6 +131,7 @@ func (c *client) FindProviders(ctx context.Context, key cid.Cid) (provs []types.
 	if err != nil {
 		return nil, err
 	}
+
 	measurement.host = req.Host
 
 	start := c.clock.Now()
@@ -119,20 +143,42 @@ func (c *client) FindProviders(ctx context.Context, key cid.Cid) (provs []types.
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	measurement.statusCode = resp.StatusCode
 	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
 		return nil, nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, httpError(resp.StatusCode, resp.Body)
 	}
 
-	parsedResp := &types.ReadProvidersResponse{}
-	err = json.NewDecoder(resp.Body).Decode(parsedResp)
-	return parsedResp.Providers, err
+	respContentType := resp.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(respContentType)
+	if err != nil {
+		resp.Body.Close()
+		return nil, fmt.Errorf("parsing Content-Type: %w", err)
+	}
+
+	switch mediaType {
+	case mediaTypeJSON:
+		defer resp.Body.Close()
+		parsedResp := &jsontypes.ReadProvidersResponse{}
+		err = json.NewDecoder(resp.Body).Decode(parsedResp)
+		iter := iter.FromSlice(parsedResp.Providers)
+		return iter, err
+
+	case mediaTypeNDJSON:
+		iter := ndjson.NewReadProvidersResponseIter(ctx, resp.Body)
+		return iter, nil
+
+	default:
+		defer resp.Body.Close()
+		logger.Errorw("unknown media type", "MediaType", mediaType, "ContentType", respContentType)
+		return nil, errors.New("unknown content type")
+	}
 }
 
 func (c *client) ProvideBitswap(ctx context.Context, keys []cid.Cid, ttl time.Duration) (time.Duration, error) {
@@ -180,7 +226,7 @@ func (c *client) ProvideBitswap(ctx context.Context, keys []cid.Cid, ttl time.Du
 
 // ProvideAsync makes a provide request to a delegated router
 func (c *client) provideSignedBitswapRecord(ctx context.Context, bswp *types.WriteBitswapProviderRecord) (time.Duration, error) {
-	req := types.WriteProvidersRequest{Providers: []types.WriteProviderRecord{bswp}}
+	req := jsontypes.WriteProvidersRequest{Providers: []types.WriteProviderRecord{bswp}}
 
 	url := c.baseURL + server.ProvidePath
 
@@ -203,7 +249,7 @@ func (c *client) provideSignedBitswapRecord(ctx context.Context, bswp *types.Wri
 	if resp.StatusCode != http.StatusOK {
 		return 0, httpError(resp.StatusCode, resp.Body)
 	}
-	var provideResult types.WriteProvidersResponse
+	var provideResult jsontypes.WriteProvidersResponse
 	err = json.NewDecoder(resp.Body).Decode(&provideResult)
 	if err != nil {
 		return 0, err
