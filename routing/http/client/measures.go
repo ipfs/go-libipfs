@@ -47,7 +47,7 @@ type measurement struct {
 	latency    time.Duration
 	statusCode int
 	host       string
-	length     int
+	length     *int
 }
 
 func (m measurement) record(ctx context.Context) {
@@ -62,14 +62,16 @@ func (m measurement) record(ctx context.Context) {
 		measureLatency.M(m.latency.Milliseconds()),
 	)
 	if m.err == nil {
-		stats.RecordWithTags(
-			ctx,
-			[]tag.Mutator{
-				tag.Upsert(keyHost, m.host),
-				tag.Upsert(keyOperation, m.operation),
-			},
-			measureLength.M(int64(m.length)),
-		)
+		if m.length != nil {
+			stats.RecordWithTags(
+				ctx,
+				[]tag.Mutator{
+					tag.Upsert(keyHost, m.host),
+					tag.Upsert(keyOperation, m.operation),
+				},
+				measureLength.M(int64(*m.length)),
+			)
+		}
 	}
 }
 
